@@ -21,11 +21,10 @@ has two parts:
 
 The field is modelled as a **graph**: crop plots (`x1…x8`) are connected through
 intermediate **junction** nodes (`O1…O4`) that the robot can travel through but
-does not inspect. The robot starts at a junction and moves edge-by-edge.
+does not inspect. The robot starts at junction **`O2`** and moves edge-by-edge.
 
 ### The main idea and objective
-The project demonstrates the **full PDDL spectrum** taught in the course, applied
-to one consistent scenario:
+The project models one consistent scenario at two levels of expressiveness:
 
 | Stage | Formalism | Core challenge |
 |-------|-----------|----------------|
@@ -54,19 +53,6 @@ only changes when the robot acts; in Q2 the crops degrade *on their own*, so
 - **`O1…O4`** — junctions: the robot can pass through them but they are *not* monitored.
 - The robot starts at junction **`O2`**.
 
-### Animated plan execution
-The repository includes animated visualizations of the generated plans
-(`plan_animation_q1.gif`, `plan_animation_q2.gif`):
-
-- The **red dot** is the robot moving along the graph edges.
-- A **blue inner ring** appears on a plot once it is **inspected**.
-- A **purple outer ring** (and a `rep` label) appears once it is **reported**.
-- In **Q2**, a **pink ring** around each plot shows its **condition level**
-  shrinking over time; critical plots turn red as they approach failure.
-
-> 📌 Open the `.gif` files (or the interactive `.html` versions) to watch the
-> robot execute each plan step by step.
-
 ---
 
 ## 3. PDDL Model Explanation
@@ -83,7 +69,7 @@ The repository includes animated visualizations of the generated plans
 **Core predicates**
 - `(robot-at ?r ?n)` — robot position
 - `(connected ?n1 ?n2)` — graph edges (declared in the problem file)
-- `(crop-condition ?p ?c)` — **explicit symbolic crop state** (required by the assignment)
+- `(crop-condition ?p ?c)` — explicit symbolic crop state
 - `(inspected ?p)` — the robot has observed this plot
 - `(reported ?p)` — the observation has been logged
 
@@ -92,8 +78,7 @@ The repository includes animated visualizations of the generated plans
   but only `plot`s can be inspected. This avoids duplicating actions and keeps the
   graph clean.
 - **Crop state is represented explicitly** as `(crop-condition ?p ?c)`, not hidden
-  inside a number. This satisfies the requirement *"represent plots and crop states
-  explicitly."*
+  inside a number, so the crop's status is a first-class fact in the model.
 - **Inspection is passive** — it only sets `(inspected ?p)` and never changes the
   crop. Monitoring observes; it does not intervene.
 - **Reporting is decoupled from position** — `report` only requires that the plot
@@ -120,15 +105,34 @@ and crop conditions are **static**.
   plots while moving as little as possible.
 
 **The two problem instances**
+
 - **Problem 1 (`problem1_1.pddl`) — stable crops, no optimization.**
-  All plots are `good`. There is **no metric**, so any valid plan that reports
-  every plot is acceptable. This proves the model is correct.
+  *Input state:* all eight plots are `good`; robot starts at `O2`; **no metric**.
+  Any valid plan that reports every plot is accepted. This proves the model is
+  correct in the simplest case.
+
 - **Problem 2 (`problem1_2.pddl`) — cost-optimized monitoring.**
-  Same field and goal, but with `(:metric minimize (total-cost))`. Run with an
-  **optimal** planner, this yields the **fewest-moves** monitoring tour. This shows
-  the model has real planning depth: the route, not just the action set, matters.
+  *Input state:* same field and goal, but with `(:metric minimize (total-cost))`.
+  Because some crops are higher-priority (more critical), the robot should finish
+  the whole monitoring sweep **as soon as possible** — i.e. *monitoring frequency
+  matters*: a shorter tour means each plot is revisited sooner in a repeated cycle.
+  Run with an **optimal** planner, this yields the **fewest-moves** tour, showing the
+  model has real planning depth: the route, not just the action set, matters.
 
 **Goal (both):** every plot reported — `(reported x1) … (reported x8)`.
+
+> **Note — a strategy that did not work.**
+> An earlier idea was to make the robot visit the **critical plots first** by using a
+> *variable* move cost instead of a flat `+1`. The plan was: give each plot a priority
+> weight, start a counter at the **sum of all priorities**, and have every `move`
+> add the *current* counter to `total-cost` while each report *decreased* the counter
+> by the reported crop's priority — so leaving a high-priority crop unreported would
+> keep charging more per move, pushing the planner to handle critical plots early.
+> In practice **ENHSP could not optimize this cost.** ENHSP's optimal search only
+> reasons about **uniform (unit) action costs** — it effectively ignores a per-action
+> cost that varies with the state — so it could not minimize this state-dependent
+> objective. We therefore kept the simple, uniform `+1`-per-move cost, which ENHSP
+> optimizes correctly.
 
 ---
 
@@ -142,42 +146,48 @@ PDDL+ adds **continuous time** through `:process` and `:event`. Crops now degrad
 - `(degrade-rate ?p)` — how fast each plot degrades
 - `(move-timer ?r)` / `(report-timer ?r)` — drive action durations
 
-**Process (required)** — continuous crop degradation:
-```
-(:process degrade
-  :parameters (?p - plot)
-  :precondition (> (condition-level ?p) -20)
-  :effect (decrease (condition-level ?p) (* #t (degrade-rate ?p))))
-```
-The level drops smoothly over time (`#t` = elapsed time), whether or not the robot
-is present.
+**Processes** *(continuous change that runs on its own)*
 
-**Event (required)** — crop failure at a threshold:
-```
-(:event crop-fails
-  :parameters (?p - plot)
-  :precondition (and (<= (condition-level ?p) -20)
-                     (not (inspected ?p)))
-  :effect (failed ?p))
-```
-If a crop's condition crosses the failure threshold **before it has been inspected**,
-the event fires automatically and the crop fails permanently — making the goal
-unreachable. (Degradation *after* inspection is harmless.)
+| Process | Runs while | Effect |
+|---------|-----------|--------|
+| `degrade ?p` | `condition-level > 0` | `condition-level` drops at `degrade-rate` (`* #t rate`) |
+| `moving ?r` | robot is moving | `move-timer` counts up |
+| `reporting ?r` | robot is reporting | `report-timer` counts up |
+
+The `degrade` process is the heart of Q2: the crop loses health smoothly over time
+whether or not the robot is present.
+
+**Events** *(automatic, threshold-triggered state changes)*
+
+| Event | Fires when | Effect |
+|-------|-----------|--------|
+| `crop-fails ?p` | `condition-level ≤ 20` **and** plot not reported | `(failed ?p)` — permanent; the plot can no longer be reported |
+| `move-complete ?r` | `move-timer ≥ 1` | robot arrives at destination; timer reset |
+| `report-complete ?r` | `report-timer ≥ 0.2` | `(reported ?p)`; timer reset |
+
+The `crop-fails` event is the failure condition: if a crop crosses the threshold
+**before it has been reported**, it fails permanently and the goal becomes
+unreachable.
 
 **Time via processes, not durative actions.**
 ENHSP does **not** support `:durative-action`. So action durations are modelled with
-**timers + processes**: a `moving` process advances `move-timer` while the robot is in
-transit, and a `move-complete` event fires when the timer reaches the move duration.
-The same pattern gives `report` its short duration.
+**timers + processes**: a `start-move` action sets the robot moving, the `moving`
+process advances `move-timer`, and the `move-complete` event fires at `timer ≥ 1`
+(a 1-second move). The same pattern gives `report` its 0.2-second duration.
 
 **The two problem instances**
+
 - **Problem 1 (`problem2_1.pddl`) — timing irrelevant.**
-  All plots start healthy with slow degradation. The robot finishes long before any
-  crop is at risk; any order works.
+  *Input state:* all plots start at `condition-level 90` with a slow `degrade-rate 2`.
+  The robot finishes long before any crop is at risk, so any order works. Confirms
+  the PDDL+ model works in the non-urgent case.
+
 - **Problem 2 (`problem2_2.pddl`) — timing critical.**
-  Some plots start with low condition and **fast** degradation. The robot must
-  prioritize them and reach them **before** the failure event fires. Here the
-  *schedule* of inspections — not just their existence — determines feasibility.
+  *Input state:* mixed degradation — `x3` starts at `95` with rate `10` and `x8` at
+  `70` with rate `10` (both **critical**), while the rest start at `90` with rates
+  `2–5`. The fast-degrading plots force the robot to **prioritize** them and reach
+  them before the `crop-fails` event triggers. Here the *schedule* of inspections —
+  not just their existence — determines feasibility.
 
 **Goal (both):** every plot inspected and reported, with no plot failing first.
 
@@ -246,10 +256,91 @@ java -jar ~/enhsp/ENHSP-Public/enhsp-dist/enhsp.jar \
 - `-dp 0.1 -de 0.1` set the planning and execution **time deltas** to 0.1 — needed in
   Q2 so the planner steps finely enough to hit the process/event time thresholds.
 
-### 4.4 Running inside VS Code (optional)
+---
+
+## 5. Results & Outputs
+
+The animations below show each plan executing on the field graph.
+
+**How to read the animations**
+- The **red dot** is the robot moving along the graph edges.
+- A **blue inner ring** appears on a plot once it is **inspected**.
+- A **purple outer ring** (with a `rep` label) appears once it is **reported**.
+- In **Q2 only**, a **pink condition ring** around each plot shrinks over time to
+  show the crop's `condition-level` dropping; critical plots turn red as they near
+  failure.
+
+---
+
+### Q1 — Problem 1 (stable crops)
+
+The planner returns a valid plan that inspects and reports all eight plots. Because
+no metric is set, the route is not necessarily minimal — this run confirms the model
+is solvable and correct.
+
+![Q1 Problem 1 plan](plan_animation_q1_p1.gif)
+
+---
+
+### Q1 — Problem 2 (cost-optimized)
+
+With `opt-hrmax` and `(:metric minimize (total-cost))`, the planner returns the
+**fewest-moves** monitoring tour. Reports — which are free and position-independent —
+are scheduled opportunistically, so the optimizer only has to minimize the travel
+needed to inspect every plot. Comparing the move count against Problem 1 shows the
+benefit of optimization.
+
+![Q1 Problem 2 plan](plan_animation_q1_p2.gif)
+
+---
+
+### Q2 — Problem 1 (timing irrelevant)
+
+All crops degrade slowly, so the robot inspects and reports everything well within
+the safe window — the **condition rings** deplete only gently and no plot is ever at
+risk. The plan succeeds regardless of visiting order, confirming the PDDL+ model
+works in the non-urgent case.
+
+![Q2 Problem 1 plan](plan_animation_q2_p1.gif)
+
+---
+
+### Q2 — Problem 2 (timing critical)
+
+The fast-degrading critical plots (`x3`, `x8`) force the robot to **race**: their
+**condition rings** drain quickly and turn red, and the robot must reach and inspect
+them just before the `crop-fails` event would trigger. If it delayed, a crop would
+cross the failure threshold and the goal would become unreachable. This demonstrates
+the central PDDL+ lesson — **inactivity has a cost, and the timing of actions decides
+feasibility.**
+
+![Q2 Problem 2 plan](plan_animation_q2_p2.gif)
+
+---
+
+## 6. Project Structure
+
+```
+.
+├── q1                     # Q1 folder 
+  ├── domain1.pddl         # Q1 domain timing irrelevant 
+  ├── problem1_1.pddl  
+  ├── problem1_2.pddl
+├── q2                     # Q2 folder 
+  ├── domain1.pddl         # Q2 domain timing dependent
+  ├── problem2_1.pddl  
+  ├── problem2_2.pddl
+
+└── README.md
+```
+
+---
+
+## 7. Running inside VS Code (optional)
+
 You can also run the planner from the **PDDL extension** (Jan Dolejsi). Add the
 following to your VS Code `settings.json` so the extension calls the **local** ENHSP
-through a small wrapper script:
+through a small wrapper script (`run_planner.sh`):
 
 ```jsonc
 {
@@ -271,81 +362,20 @@ through a small wrapper script:
 ```
 
 Here `run_planner.sh` is a small wrapper that invokes the local ENHSP jar with the
-chosen planner flags. Open a problem file and use **“PDDL: Run the planner”**.
+chosen planner flags. Open a problem file and use **"PDDL: Run the planner"**.
 
 > ℹ️ The VS Code extension produces the **same plan output** as the terminal, just
-> displayed in its own panel. The terminal is recommended, as the in-editor
-> visualization is essentially the same plain-text result.
+> shown in its own panel. The **terminal is recommended**, since the in-editor
+> result is essentially the same plain-text plan.
 
 ---
 
-## 5. Results & Outputs
+## 8. Summary
 
-### Q1 — Problem 1 (stable crops)
-The planner returns a valid plan that inspects and reports all eight plots. Because
-no metric is set, the route is not necessarily minimal — this run only confirms the
-model is solvable and correct.
-
-### Q1 — Problem 2 (cost-optimized)
-With `opt-hrmax` and `(:metric minimize (total-cost))`, the planner returns the
-**fewest-moves** monitoring tour. Example (excerpt):
-```
-0.0: (move r1 O2 x6)
-1.0: (inspect r1 x6)
-...
-25.0: (report r1 x4)
-```
-Comparing the `total-cost` (move count) against Problem 1 shows the benefit of
-optimization: the optimized tour visits every plot with minimal travel, while
-reports — which are free and position-independent — are scheduled opportunistically.
-
-### Q2 — Problem 1 (timing irrelevant)
-All crops degrade slowly, so the robot inspects and reports everything well within
-the safe window. The plan succeeds regardless of visiting order, confirming the
-PDDL+ model works in the non-urgent case.
-
-### Q2 — Problem 2 (timing critical)
-Fast-degrading plots force the robot to **race**: it visits the at-risk plots early,
-inspecting them just before the `crop-fails` event would trigger. If the robot
-delayed, a crop would cross the failure threshold and the goal would become
-unreachable. This demonstrates the central PDDL+ lesson — **inactivity has a cost,
-and the timing of actions decides feasibility.**
-
-### Visual outputs
-| File | Description |
-|------|-------------|
-| `plan_animation_q1.gif` / `.html` | Q1 plan execution (static crops, step-based) |
-| `plan_animation_q2.gif` / `.html` | Q2 plan execution (continuous degradation, timing race) |
-
-Each animation shows the robot moving through the field, plots gaining their
-**inspected** (blue) and **reported** (purple) rings, and — in Q2 — the **condition
-rings** depleting over time.
-
----
-
-## 6. Project Structure
-
-```
-.
-├── domain1.pddl          # Q1 classical PDDL domain
-├── problem1_1.pddl       # Q1 Problem 1 — stable crops (no optimization)
-├── problem1_2.pddl       # Q1 Problem 2 — cost-optimized routing
-├── domain2.pddl          # Q2 PDDL+ domain (processes + events)
-├── problem2_1.pddl       # Q2 Problem 1 — timing irrelevant
-├── problem2_2.pddl       # Q2 Problem 2 — timing critical
-├── plan_animation_q1.*   # Q1 plan visualization (gif + interactive html)
-├── plan_animation_q2.*   # Q2 plan visualization (gif + interactive html)
-└── README.md
-```
-
----
-
-## 7. Summary
-
-This project models a single agricultural-monitoring scenario across two levels of
-the PDDL spectrum. **Q1** treats it as a classical routing problem where efficiency
-(move count) is optimized. **Q2** introduces continuous time: crops degrade on their
-own via a **process**, fail via an **event**, and the robot must schedule its
-inspections to beat the clock. Together they illustrate the progression from
-**discrete, static planning** to **continuous, time-critical hybrid planning** —
-and why the right level of abstraction depends on the problem.
+This project models a single agricultural-monitoring scenario at two levels of the
+PDDL spectrum. **Q1** treats it as a classical routing problem where efficiency (move
+count) is optimized. **Q2** introduces continuous time: crops degrade on their own via
+a **process**, fail via an **event**, and the robot must schedule its inspections to
+beat the clock. Together they illustrate the progression from **discrete, static
+planning** to **continuous, time-critical hybrid planning** — and why the right level
+of abstraction depends on the problem.
