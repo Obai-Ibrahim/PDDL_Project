@@ -20,7 +20,7 @@
 
 (define (domain crop-monitoring-q2)
 
-  (:requirements :typing :negative-preconditions :fluents
+  (:requirements :typing :fluents
                  :time :continuous-effects)
 
   (:types

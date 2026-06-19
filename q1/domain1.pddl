@@ -16,7 +16,7 @@
 
 (define (domain crop-monitoring-q1)
 
-  (:requirements :typing :negative-preconditions :fluents :equality)
+  (:requirements :typing :fluents :equality)
 
   (:types
     node           - object
